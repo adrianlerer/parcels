@@ -1,0 +1,283 @@
+#!/usr/bin/env bash
+# parcel — package the current repo + agent session and ship it to another
+# machine over Tailscale SSH, where it keeps running in tmux.
+#
+# Agents supported: claude (Claude Code), codex (OpenAI Codex), pi (pi/oh-my-pi),
+# droid (Factory AI).
+#
+# Usage:
+#   parcel send <target> [--agent claude|codex|pi|droid] [--session <id>]
+#                        [--prompt "<text>"] [--idle] [--dest <remote-dir>]
+#   parcel status [target]
+#   parcel doctor <target>
+#   parcel auth <target>
+#   parcel targets
+set -euo pipefail
+
+PARCELS_HOME="${PARCELS_HOME:-$HOME/.parcels}"
+TARGETS_DIR="$PARCELS_HOME/targets"
+DEFAULT_PROMPT="You have been handed off from another machine. Read HANDOFF.md at the repo root, verify the state it describes (git status, running processes), and continue the work. Update HANDOFF.md as you go."
+
+die() { echo "parcel: $*" >&2; exit 1; }
+info() { echo "· $*"; }
+
+# ---------------------------------------------------------------- targets ----
+load_target() {
+  local name="$1"
+  local conf="$TARGETS_DIR/$name.conf"
+  [[ -f "$conf" ]] || die "unknown target '$name' (no $conf). Run: parcel targets"
+  # conf defines: HOST (ssh host), DEST_BASE (remote dir, relative to remote $HOME), AGENT (default agent)
+  HOST="" DEST_BASE="ai" AGENT="claude"
+  # shellcheck disable=SC1090
+  source "$conf"
+  [[ -n "$HOST" ]] || die "target '$name' has no HOST"
+}
+
+cmd_targets() {
+  echo "Targets in $TARGETS_DIR:"
+  local f
+  for f in "$TARGETS_DIR"/*.conf; do
+    [[ -e "$f" ]] || { echo "  (none — create $TARGETS_DIR/<name>.conf with HOST=/DEST_BASE=/AGENT=)"; return; }
+    local HOST="" DEST_BASE="ai" AGENT="claude"
+    # shellcheck disable=SC1090
+    source "$f"
+    printf "  %-12s host=%-14s dest=~%s/  default-agent=%s\n" "$(basename "$f" .conf)" "$HOST" "${DEST_BASE#/}" "$AGENT"
+  done
+}
+
+# ------------------------------------------------------- path sanitizers -----
+# Each agent derives its per-project session dir from the cwd differently.
+claude_dir()  { echo "$HOME/.claude/projects/$(echo "$1" | sed 's/[^A-Za-z0-9]/-/g')"; }
+claude_rdir() { echo ".claude/projects/$(echo "$1" | sed 's/[^A-Za-z0-9]/-/g')"; }
+pi_dir()      { echo "$HOME/.pi/agent/sessions/-$(echo "$1" | tr '/' '-')--"; }
+pi_rdir()     { echo ".pi/agent/sessions/-$(echo "$1" | tr '/' '-')--"; }
+droid_dir()   { echo "$HOME/.factory/sessions/$(echo "$1" | tr '/' '-')"; }
+droid_rdir()  { echo ".factory/sessions/$(echo "$1" | tr '/' '-')"; }
+
+newest_session_jsonl() {  # $1=dir ; prints newest <uuid>.jsonl path
+  ls -t "$1"/*.jsonl 2>/dev/null | grep -E '/[0-9a-f]{8}-[0-9a-f-]{27}\.jsonl$' | head -1
+}
+
+# ---------------------------------------------------------------- doctor -----
+cmd_doctor() {
+  local name="$1"; load_target "$name"
+  info "checking $name ($HOST) over ssh..."
+  ssh -o ConnectTimeout=8 "$HOST" '
+    echo "user=$USER home=$HOME"
+    for b in tmux rsync git jq claude codex pi droid; do
+      if command -v "$b" >/dev/null 2>&1; then echo "  $b: ok"; else echo "  $b: MISSING"; fi
+    done
+    [[ -f ~/.claude/.credentials.json || -n "${CLAUDE_CODE_OAUTH_TOKEN:-}" ]] && echo "  claude auth: ok" || echo "  claude auth: MISSING (run \`claude setup-token\` on a machine with OAuth, export CLAUDE_CODE_OAUTH_TOKEN here, or \`claude login\`)"
+    [[ -f ~/.codex/auth.json ]]    && echo "  codex auth: ok"  || echo "  codex auth: MISSING (parcel auth <target> copies it)"
+    [[ -f ~/.pi/agent/auth.json ]] && echo "  pi auth: ok"     || echo "  pi auth: MISSING (parcel auth <target> copies it)"
+    ls ~/.factory/auth* >/dev/null 2>&1 && echo "  droid auth: present (machine-bound; run \`droid\` once to verify)" || echo "  droid auth: MISSING (run \`droid\` once to log in)"
+  '
+}
+
+# ------------------------------------------------------------------ auth -----
+cmd_auth() {
+  local name="$1"; load_target "$name"
+  info "syncing copyable credentials to $name ($HOST)..."
+  ssh "$HOST" 'mkdir -p ~/.codex ~/.pi/agent'
+  [[ -f "$HOME/.codex/auth.json" ]] && { rsync -a "$HOME/.codex/auth.json" "$HOST:.codex/auth.json"; info "codex auth.json → $name"; }
+  [[ -f "$HOME/.pi/agent/auth.json" ]] && { rsync -a "$HOME/.pi/agent/auth.json" "$HOST:.pi/agent/auth.json"; info "pi auth.json → $name"; }
+  echo "· claude: OAuth is keychain/machine-bound. On $name run \`claude login\`, or mint a token"
+  echo "  here with \`claude setup-token\` and set CLAUDE_CODE_OAUTH_TOKEN in the remote shell profile."
+  echo "· droid: auth is encrypted per-machine. Run \`droid\` once on $name to log in."
+}
+
+# ---------------------------------------------------------------- status -----
+cmd_status() {
+  local name="${1:-}"
+  local files=("$TARGETS_DIR"/*.conf)
+  [[ -n "$name" ]] && files=("$TARGETS_DIR/$name.conf")
+  local f
+  for f in "${files[@]}"; do
+    [[ -e "$f" ]] || continue
+    local t; t="$(basename "$f" .conf)"
+    load_target "$t"
+    echo "== $t ($HOST) =="
+    ssh -o ConnectTimeout=8 "$HOST" '
+      if ! command -v tmux >/dev/null || ! tmux ls 2>/dev/null | grep -q "^parcel-"; then echo "  no parcel sessions"; exit 0; fi
+      tmux ls | grep "^parcel-" | while IFS=: read -r s _; do
+        echo "  [$s] — last output:"
+        tmux capture-pane -p -t "$s" 2>/dev/null | grep -v "^$" | tail -8 | sed "s/^/    /"
+      done
+    ' || echo "  (unreachable)"
+  done
+}
+
+# ---------------------------------------------------------- session copy -----
+# Each ship_* copies the chosen session into the remote agent's expected
+# location for REMOTE_REPO, and sets RESUME_CMD for the tmux launch.
+ship_claude() {
+  local sdir; sdir="$(claude_dir "$REPO")"
+  local sfile
+  if [[ -n "$SESSION_ID" ]]; then sfile="$sdir/$SESSION_ID.jsonl"
+  else sfile="$(newest_session_jsonl "$sdir")"; fi
+  [[ -f "$sfile" ]] || die "no claude session found in $sdir"
+  local sid; sid="$(basename "$sfile" .jsonl)"
+  local rdir; rdir="$(claude_rdir "$REMOTE_REPO")"
+  info "claude session $sid → $HOST:$rdir/"
+  ssh "$HOST" "mkdir -p '$rdir'"
+  rsync -a "$sfile" "$HOST:$rdir/"
+  RESUME_CMD="claude --resume $sid --dangerously-skip-permissions $(printf '%q' "$PROMPT")"
+}
+
+ship_pi() {
+  local sdir; sdir="$(pi_dir "$REPO")"
+  local sfile
+  if [[ -n "$SESSION_ID" ]]; then sfile="$(ls "$sdir"/*"$SESSION_ID"*.jsonl 2>/dev/null | head -1)"
+  else sfile="$(ls -t "$sdir"/*.jsonl 2>/dev/null | head -1)"; fi
+  [[ -f "${sfile:-}" ]] || die "no pi session found in $sdir"
+  local rdir; rdir="$(pi_rdir "$REMOTE_REPO")"
+  info "pi session $(basename "$sfile") → $HOST:$rdir/"
+  ssh "$HOST" "mkdir -p '$rdir'"
+  rsync -a "$sfile" "$HOST:$rdir/"
+  RESUME_CMD="pi -c $(printf '%q' "$PROMPT")"
+}
+
+ship_codex() {
+  local sfile
+  if [[ -n "$SESSION_ID" ]]; then
+    sfile="$(find "$HOME/.codex/sessions" -name "*$SESSION_ID*.jsonl" | head -1)"
+  else
+    # newest rollout whose header records this repo as cwd (search recent files)
+    sfile="$(find "$HOME/.codex/sessions" -name 'rollout-*.jsonl' -mtime -14 -print0 \
+      | xargs -0 grep -l "\"cwd\":\"$REPO\"" 2>/dev/null \
+      | xargs -I{} stat -f '%m {}' {} 2>/dev/null | sort -rn | head -1 | cut -d' ' -f2-)"
+  fi
+  [[ -f "${sfile:-}" ]] || die "no codex session found for $REPO (try --session <id>)"
+  local rel="${sfile#"$HOME"/.codex/sessions/}"
+  local sid; sid="$(basename "$sfile" .jsonl)"; sid="${sid: -36}"
+  info "codex session $sid → $HOST:.codex/sessions/$rel"
+  ssh "$HOST" "mkdir -p '.codex/sessions/$(dirname "$rel")'"
+  rsync -a "$sfile" "$HOST:.codex/sessions/$rel"
+  RESUME_CMD="codex exec resume $sid --dangerously-bypass-approvals-and-sandbox $(printf '%q' "$PROMPT"); exec bash"
+}
+
+ship_droid() {
+  local sdir; sdir="$(droid_dir "$REPO")"
+  local sfile
+  if [[ -n "$SESSION_ID" ]]; then sfile="$sdir/$SESSION_ID.jsonl"
+  else sfile="$(newest_session_jsonl "$sdir")"; fi
+  [[ -f "${sfile:-}" ]] || die "no droid session found in $sdir"
+  local sid; sid="$(basename "$sfile" .jsonl)"
+  local rdir; rdir="$(droid_rdir "$REMOTE_REPO")"
+  info "droid session $sid → $HOST:$rdir/ (+ index entry)"
+  ssh "$HOST" "mkdir -p '$rdir'"
+  rsync -a "$sfile" "$HOST:$rdir/"
+  [[ -f "$sdir/$sid.settings.json" ]] && rsync -a "$sdir/$sid.settings.json" "$HOST:$rdir/"
+  # register in the remote sessions index so `droid exec -s` can find it
+  ssh "$HOST" "sid='$sid' cwd='$REMOTE_REPO' python3 - <<'PYEOF'
+import json, os, time
+p = os.path.expanduser('~/.factory/sessions-index.json')
+try: idx = json.load(open(p))
+except Exception: idx = {'version': 1, 'entries': []}
+sid, cwd = os.environ['sid'], os.environ['cwd']
+idx['entries'] = [e for e in idx['entries'] if e.get('sessionId') != sid]
+idx['entries'].append({'sessionId': sid, 'mtime': int(time.time()*1000), 'title': 'parcel handoff', 'cwd': cwd, 'messagesCount': 1})
+json.dump(idx, open(p, 'w'))
+PYEOF"
+  RESUME_CMD="droid exec -s $sid --auto high $(printf '%q' "$PROMPT"); exec bash"
+}
+
+# ------------------------------------------------------------------ send -----
+cmd_send() {
+  local name="$1"; shift
+  load_target "$name"
+  SESSION_ID="" PROMPT="$DEFAULT_PROMPT" IDLE=0 DEST_OVERRIDE=""
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --agent) AGENT="$2"; shift 2 ;;
+      --session) SESSION_ID="$2"; shift 2 ;;
+      --prompt) PROMPT="$2"; shift 2 ;;
+      --dest) DEST_OVERRIDE="$2"; shift 2 ;;
+      --idle) IDLE=1; shift ;;
+      *) die "unknown flag: $1" ;;
+    esac
+  done
+
+  REPO="$(git rev-parse --show-toplevel 2>/dev/null)" || die "not inside a git repo"
+  local repo_name; repo_name="$(basename "$REPO")"
+  local remote_home; remote_home="$(ssh -o ConnectTimeout=8 "$HOST" 'echo $HOME')"
+  [[ -n "$remote_home" ]] || die "cannot reach $HOST"
+  REMOTE_REPO="${DEST_OVERRIDE:-$remote_home/$DEST_BASE/$repo_name}"
+
+  # 1. HANDOFF.md — mechanical state snapshot (agent-written intent above it survives)
+  local snap="## Machine state (auto-generated by parcel — do not edit)
+- shipped: $(date '+%Y-%m-%d %H:%M %Z') from $(hostname -s):$REPO
+- target: $name → $REMOTE_REPO (agent: $AGENT)
+- branch: $(git -C "$REPO" branch --show-current 2>/dev/null || echo detached)
+- last commit: $(git -C "$REPO" log --oneline -1 2>/dev/null || echo none)
+\`\`\`
+$(git -C "$REPO" status --short | head -50)
+\`\`\`"
+  if [[ -f "$REPO/HANDOFF.md" ]]; then
+    # replace previous auto section if present, else append
+    python3 - "$REPO/HANDOFF.md" <<PYEOF
+import sys, re
+p = sys.argv[1]
+body = open(p).read()
+snap = '''$snap'''
+marker = '## Machine state (auto-generated by parcel'
+i = body.find(marker)
+body = (body[:i].rstrip() if i >= 0 else body.rstrip()) + '\n\n' + snap + '\n'
+open(p, 'w').write(body)
+PYEOF
+  else
+    printf '# HANDOFF\n\n(No agent-written context — resuming from session history alone.)\n\n%s\n' "$snap" > "$REPO/HANDOFF.md"
+  fi
+  info "HANDOFF.md updated"
+
+  # 2. Working tree (including .git, untracked, .env) → remote
+  info "rsync $REPO → $HOST:$REMOTE_REPO"
+  ssh "$HOST" "mkdir -p '$REMOTE_REPO'"
+  rsync -az --delete \
+    --exclude node_modules --exclude .venv --exclude venv \
+    --exclude __pycache__ --exclude .DS_Store --exclude .next --exclude target/debug --exclude target/release \
+    "$REPO/" "$HOST:$REMOTE_REPO/"
+
+  # 3. Session transplant + resume command
+  RESUME_CMD=""
+  case "$AGENT" in
+    claude) ship_claude ;;
+    codex)  ship_codex ;;
+    pi)     ship_pi ;;
+    droid)  ship_droid ;;
+    *) die "unknown agent '$AGENT'" ;;
+  esac
+
+  # 4. Launch in tmux on the remote
+  if [[ "$IDLE" == 1 ]]; then
+    echo "✓ parceled (idle). Start it later on $name with:"
+    echo "    cd $REMOTE_REPO && $RESUME_CMD"
+    return
+  fi
+  local tname="parcel-$repo_name"
+  ssh "$HOST" "mkdir -p '$REMOTE_REPO/.parcel'"
+  printf '#!/usr/bin/env bash\ncd %q || exit 1\n%s\n' "$REMOTE_REPO" "$RESUME_CMD" | ssh "$HOST" "cat > '$REMOTE_REPO/.parcel/launch.sh' && chmod +x '$REMOTE_REPO/.parcel/launch.sh'"
+  ssh "$HOST" "tmux kill-session -t '$tname' 2>/dev/null; tmux new-session -d -s '$tname' \"bash -lc '$REMOTE_REPO/.parcel/launch.sh'\""
+  sleep 3
+  local alive
+  alive="$(ssh "$HOST" "tmux ls 2>/dev/null | grep -c '^$tname:' || true")"
+  if [[ "$alive" == "1" ]]; then
+    echo "✓ running on $name in tmux session '$tname'"
+    echo "    watch:  parcel status $name"
+    echo "    attach: ssh -t $HOST tmux attach -t $tname"
+  else
+    die "tmux session did not survive launch — check: ssh $HOST 'bash -lc $REMOTE_REPO/.parcel/launch.sh'"
+  fi
+}
+
+# ------------------------------------------------------------------ main -----
+mkdir -p "$TARGETS_DIR"
+cmd="${1:-}"; shift || true
+case "$cmd" in
+  send)    [[ $# -ge 1 ]] || die "usage: parcel send <target> [flags]"; cmd_send "$@" ;;
+  status)  cmd_status "${1:-}" ;;
+  doctor)  [[ $# -ge 1 ]] || die "usage: parcel doctor <target>"; cmd_doctor "$1" ;;
+  auth)    [[ $# -ge 1 ]] || die "usage: parcel auth <target>"; cmd_auth "$1" ;;
+  targets) cmd_targets ;;
+  *) sed -n '2,15p' "$0" | sed 's/^# \{0,1\}//'; exit 1 ;;
+esac
