@@ -121,6 +121,16 @@ ship_claude() {
   info "claude session $sid → $HOST:$rdir/"
   ssh "$HOST" "mkdir -p '$rdir'"
   rsync -a "$sfile" "$HOST:$rdir/"
+  # pre-trust the folder so resume doesn't stall on the trust dialog
+  ssh "$HOST" "repo='$REMOTE_REPO' python3 - <<'PYEOF'
+import json, os
+p = os.path.expanduser('~/.claude.json')
+try: cfg = json.load(open(p))
+except Exception: cfg = {}
+proj = cfg.setdefault('projects', {}).setdefault(os.environ['repo'], {})
+proj['hasTrustDialogAccepted'] = True
+json.dump(cfg, open(p, 'w'))
+PYEOF"
   RESUME_CMD="claude --resume $sid --dangerously-skip-permissions $(printf '%q' "$PROMPT")"
 }
 
