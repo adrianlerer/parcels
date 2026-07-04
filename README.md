@@ -6,6 +6,17 @@ in tmux and keeps working.
 
 Supports **Claude Code**, **Codex**, **pi**, and **Droid** sessions.
 
+## Install
+
+```sh
+git clone https://github.com/0xSero/parcels && cd parcels && ./install.sh
+```
+
+This symlinks `parcel` into `~/.local/bin`, installs the `/parcel` skill for
+Claude Code (`~/.claude/skills/parcel`), and seeds `~/.parcels/targets/` with an
+example target config. Requirements: `ssh` access to your targets (Tailscale
+MagicDNS names work great), `rsync`, `tmux` + the agent CLIs on the targets.
+
 ```
 parcel send pop-os                      # ship cwd repo + newest claude session, resume there
 parcel send pop-os --agent droid        # same but for a droid session
