@@ -1,6 +1,6 @@
 ---
 name: parcel
-description: Ship the current work — repo, uncommitted changes, .env files, and the live agent session — to another machine over Tailscale SSH, where the agent resumes in tmux and keeps working. Use when the user says /parcel, "hand off to <machine>", "send this work to another machine", "keep this running after I close the laptop", or wants to move a coding session (Claude Code, Codex, pi, or Droid) to a remote box.
+description: Ship the current work — repo, uncommitted changes, and the live agent session — to another machine over Tailscale SSH. Defaults are safe-idle: secrets are excluded, remote deletion is off, and launch requires --launch. Use when the user says /parcel, "hand off to <machine>", "send this work to another machine", "keep this running after I close the laptop", or wants to move a coding session (Claude Code, Codex, pi, or Droid) to a trusted remote box.
 license: MIT
 ---
 
@@ -33,7 +33,11 @@ The `parcel` CLI is on PATH. Targets are machines defined in
      the newest session for this cwd.
    - `--prompt "..."` steers what the remote agent does first (default:
      read HANDOFF.md and continue).
-   - `--idle` ships without launching anything.
+   - The default is idle. Add `--launch` only when the user explicitly wants the
+     remote tmux session started now.
+   - Do not add `--include-secrets`, `--delete-remote`, `--trust-remote-repo`,
+     or `--allow-dangerous-agent-flags` unless the user explicitly approves that
+     risk for a trusted target.
 
 3. **Verify it is actually running — never assume.** `parcel status <target>`
    tails the remote tmux pane; you should see the agent producing output. If
@@ -48,13 +52,15 @@ The `parcel` CLI is on PATH. Targets are machines defined in
 - **claude** — user runs `claude login` once on the target, or mints a token on
   an authed machine with `claude setup-token` and sets `CLAUDE_CODE_OAUTH_TOKEN`
   in the target's shell profile.
-- **codex / pi** — `parcel auth <target>` copies the credential files.
+- **codex / pi** — `parcel auth <target> --confirm-copy-credentials` copies the
+  credential files. Use only with explicit user approval and a fully trusted
+  target.
 - **droid** — user runs `droid` once on the target to log in.
 
 ## Notes
 
 - Only git repos can be parceled (`parcel send` runs from inside the repo).
-- The whole working tree ships — including untracked files and `.env`s — so
-  warn the user before sending a repo with secrets to a shared machine.
-- Re-sending the same repo overwrites the remote copy (rsync --delete) and
-  restarts the tmux session.
+- The working tree ships including untracked files, but `.env`, key files, and
+  common cloud/auth folders are excluded unless `--include-secrets` is used.
+- Re-sending does not delete remote files unless `--delete-remote` is used.
+- The remote agent is not launched unless `--launch` is used.

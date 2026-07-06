@@ -7,7 +7,9 @@
 #
 # Usage:
 #   parcel send <target> [--agent claude|codex|pi|droid] [--session <id>]
-#                        [--prompt "<text>"] [--idle] [--dest <remote-dir>]
+#                        [--prompt "<text>"] [--launch] [--include-secrets]
+#                        [--delete-remote] [--trust-remote-repo]
+#                        [--allow-dangerous-agent-flags] [--dest <remote-dir>]
 #   parcel status [target]
 #   parcel doctor <target>
 #   parcel auth <target>
@@ -26,10 +28,22 @@ load_target() {
   local name="$1"
   local conf="$TARGETS_DIR/$name.conf"
   [[ -f "$conf" ]] || die "unknown target '$name' (no $conf). Run: parcel targets"
-  # conf defines: HOST (ssh host), DEST_BASE (remote dir, relative to remote $HOME), AGENT (default agent)
+  # conf defines: HOST (ssh host), DEST_BASE (remote dir, relative to remote $HOME), AGENT (default agent).
+  # Parse it as data instead of sourcing arbitrary shell.
   HOST="" DEST_BASE="ai" AGENT="claude"
-  # shellcheck disable=SC1090
-  source "$conf"
+  while IFS='=' read -r key value; do
+    key="${key%%[[:space:]]*}"
+    value="${value%%#*}"
+    value="${value%"${value##*[![:space:]]}"}"
+    value="${value#"${value%%[![:space:]]*}"}"
+    value="${value%\"}"; value="${value#\"}"
+    value="${value%\'}"; value="${value#\'}"
+    case "$key" in
+      HOST|DEST_BASE|AGENT) printf -v "$key" '%s' "$value" ;;
+      ""|\#*) ;;
+      *) die "unsupported key '$key' in $conf (allowed: HOST, DEST_BASE, AGENT)" ;;
+    esac
+  done < "$conf"
   [[ -n "$HOST" ]] || die "target '$name' has no HOST"
 }
 
@@ -39,8 +53,7 @@ cmd_targets() {
   for f in "$TARGETS_DIR"/*.conf; do
     [[ -e "$f" ]] || { echo "  (none — create $TARGETS_DIR/<name>.conf with HOST=/DEST_BASE=/AGENT=)"; return; }
     local HOST="" DEST_BASE="ai" AGENT="claude"
-    # shellcheck disable=SC1090
-    source "$f"
+    load_target "$(basename "$f" .conf)"
     printf "  %-12s host=%-14s dest=~%s/  default-agent=%s\n" "$(basename "$f" .conf)" "$HOST" "${DEST_BASE#/}" "$AGENT"
   done
 }
@@ -68,15 +81,17 @@ cmd_doctor() {
       if command -v "$b" >/dev/null 2>&1; then echo "  $b: ok"; else echo "  $b: MISSING"; fi
     done
     [[ -f ~/.claude/.credentials.json || -n "${CLAUDE_CODE_OAUTH_TOKEN:-}" ]] && echo "  claude auth: ok" || echo "  claude auth: MISSING (run \`claude setup-token\` on a machine with OAuth, export CLAUDE_CODE_OAUTH_TOKEN here, or \`claude login\`)"
-    [[ -f ~/.codex/auth.json ]]    && echo "  codex auth: ok"  || echo "  codex auth: MISSING (parcel auth <target> copies it)"
-    [[ -f ~/.pi/agent/auth.json ]] && echo "  pi auth: ok"     || echo "  pi auth: MISSING (parcel auth <target> copies it)"
+    [[ -f ~/.codex/auth.json ]]    && echo "  codex auth: ok"  || echo "  codex auth: MISSING (parcel auth <target> --confirm-copy-credentials copies it)"
+    [[ -f ~/.pi/agent/auth.json ]] && echo "  pi auth: ok"     || echo "  pi auth: MISSING (parcel auth <target> --confirm-copy-credentials copies it)"
     ls ~/.factory/auth* >/dev/null 2>&1 && echo "  droid auth: present (machine-bound; run \`droid\` once to verify)" || echo "  droid auth: MISSING (run \`droid\` once to log in)"
   '
 }
 
 # ------------------------------------------------------------------ auth -----
 cmd_auth() {
-  local name="$1"; load_target "$name"
+  local name="$1"; shift || true
+  [[ "${1:-}" == "--confirm-copy-credentials" ]] || die "refusing to copy credentials without --confirm-copy-credentials"
+  load_target "$name"
   info "syncing copyable credentials to $name ($HOST)..."
   ssh "$HOST" 'mkdir -p ~/.codex ~/.pi/agent'
   [[ -f "$HOME/.codex/auth.json" ]] && { rsync -a "$HOME/.codex/auth.json" "$HOST:.codex/auth.json"; info "codex auth.json → $name"; }
@@ -121,8 +136,9 @@ ship_claude() {
   info "claude session $sid → $HOST:$rdir/"
   ssh "$HOST" "mkdir -p '$rdir'"
   rsync -a "$sfile" "$HOST:$rdir/"
-  # pre-trust the folder so resume doesn't stall on the trust dialog
-  ssh "$HOST" "repo='$REMOTE_REPO' python3 - <<'PYEOF'
+  if [[ "$TRUST_REMOTE_REPO" == 1 ]]; then
+    # pre-trust the folder so resume doesn't stall on the trust dialog
+    ssh "$HOST" "repo='$REMOTE_REPO' python3 - <<'PYEOF'
 import json, os
 p = os.path.expanduser('~/.claude.json')
 try: cfg = json.load(open(p))
@@ -131,7 +147,12 @@ proj = cfg.setdefault('projects', {}).setdefault(os.environ['repo'], {})
 proj['hasTrustDialogAccepted'] = True
 json.dump(cfg, open(p, 'w'))
 PYEOF"
-  RESUME_CMD="claude --resume $sid --dangerously-skip-permissions $(printf '%q' "$PROMPT")"
+  fi
+  if [[ "$ALLOW_DANGEROUS_AGENT_FLAGS" == 1 ]]; then
+    RESUME_CMD="claude --resume $sid --dangerously-skip-permissions $(printf '%q' "$PROMPT")"
+  else
+    RESUME_CMD="claude --resume $sid $(printf '%q' "$PROMPT")"
+  fi
 }
 
 ship_pi() {
@@ -163,7 +184,11 @@ ship_codex() {
   info "codex session $sid → $HOST:.codex/sessions/$rel"
   ssh "$HOST" "mkdir -p '.codex/sessions/$(dirname "$rel")'"
   rsync -a "$sfile" "$HOST:.codex/sessions/$rel"
-  RESUME_CMD="codex exec resume $sid --dangerously-bypass-approvals-and-sandbox $(printf '%q' "$PROMPT"); exec bash"
+  if [[ "$ALLOW_DANGEROUS_AGENT_FLAGS" == 1 ]]; then
+    RESUME_CMD="codex exec resume $sid --dangerously-bypass-approvals-and-sandbox $(printf '%q' "$PROMPT"); exec bash"
+  else
+    RESUME_CMD="codex exec resume $sid $(printf '%q' "$PROMPT"); exec bash"
+  fi
 }
 
 ship_droid() {
@@ -196,7 +221,8 @@ PYEOF"
 cmd_send() {
   local name="$1"; shift
   load_target "$name"
-  SESSION_ID="" PROMPT="$DEFAULT_PROMPT" IDLE=0 DEST_OVERRIDE=""
+  SESSION_ID="" PROMPT="$DEFAULT_PROMPT" IDLE=1 DEST_OVERRIDE=""
+  INCLUDE_SECRETS=0 ALLOW_DANGEROUS_AGENT_FLAGS=0 TRUST_REMOTE_REPO=0 DELETE_REMOTE=0
   while [[ $# -gt 0 ]]; do
     case "$1" in
       --agent) AGENT="$2"; shift 2 ;;
@@ -204,6 +230,11 @@ cmd_send() {
       --prompt) PROMPT="$2"; shift 2 ;;
       --dest) DEST_OVERRIDE="$2"; shift 2 ;;
       --idle) IDLE=1; shift ;;
+      --launch) IDLE=0; shift ;;
+      --include-secrets) INCLUDE_SECRETS=1; shift ;;
+      --delete-remote) DELETE_REMOTE=1; shift ;;
+      --trust-remote-repo) TRUST_REMOTE_REPO=1; shift ;;
+      --allow-dangerous-agent-flags) ALLOW_DANGEROUS_AGENT_FLAGS=1; shift ;;
       *) die "unknown flag: $1" ;;
     esac
   done
@@ -240,13 +271,28 @@ PYEOF
   fi
   info "HANDOFF.md updated"
 
-  # 2. Working tree (including .git, untracked, .env) → remote
+  # 2. Working tree (including .git and untracked files) → remote.
+  # Secrets are excluded by default; use --include-secrets only for fully trusted targets.
   info "rsync $REPO → $HOST:$REMOTE_REPO"
   ssh "$HOST" "mkdir -p '$REMOTE_REPO'"
-  rsync -az --delete \
+  rsync_args=(
+    -az
     --exclude node_modules --exclude .venv --exclude venv \
     --exclude __pycache__ --exclude .DS_Store --exclude .next --exclude target/debug --exclude target/release \
-    "$REPO/" "$HOST:$REMOTE_REPO/"
+  )
+  [[ "$DELETE_REMOTE" == 1 ]] && rsync_args+=(--delete)
+  if [[ -f "$REPO/.parcelignore" ]]; then
+    rsync_args+=(--exclude-from "$REPO/.parcelignore")
+  fi
+  if [[ "$INCLUDE_SECRETS" != 1 ]]; then
+    rsync_args+=(
+      --exclude '.env' --exclude '.env.*' --exclude '*.pem' --exclude '*.key'
+      --exclude '*_rsa' --exclude '*_ed25519' --exclude '.aws' --exclude '.gcloud'
+      --exclude '.azure' --exclude '.config/gcloud' --exclude '.codex/auth.json'
+      --exclude '.pi/agent/auth.json'
+    )
+  fi
+  rsync "${rsync_args[@]}" "$REPO/" "$HOST:$REMOTE_REPO/"
 
   # 3. Session transplant + resume command
   RESUME_CMD=""
@@ -260,8 +306,9 @@ PYEOF
 
   # 4. Launch in tmux on the remote
   if [[ "$IDLE" == 1 ]]; then
-    echo "✓ parceled (idle). Start it later on $name with:"
+    echo "✓ parceled (idle by default). Start it later on $name with:"
     echo "    cd $REMOTE_REPO && $RESUME_CMD"
+    echo "    or resend with --launch to start tmux automatically."
     return
   fi
   local tname="parcel-$repo_name"
@@ -287,7 +334,7 @@ case "$cmd" in
   send)    [[ $# -ge 1 ]] || die "usage: parcel send <target> [flags]"; cmd_send "$@" ;;
   status)  cmd_status "${1:-}" ;;
   doctor)  [[ $# -ge 1 ]] || die "usage: parcel doctor <target>"; cmd_doctor "$1" ;;
-  auth)    [[ $# -ge 1 ]] || die "usage: parcel auth <target>"; cmd_auth "$1" ;;
+  auth)    [[ $# -ge 1 ]] || die "usage: parcel auth <target> --confirm-copy-credentials"; cmd_auth "$@" ;;
   targets) cmd_targets ;;
   *) sed -n '2,15p' "$0" | sed 's/^# \{0,1\}//'; exit 1 ;;
 esac
